@@ -40,6 +40,8 @@ pub struct AppState {
     is_searching: bool,
     model_list_state: ratatui::widgets::ListState,
     search_list_state: ratatui::widgets::ListState,
+    chat_scroll_state: ratatui::widgets::ListState,
+    input_mode: bool,
     status_message: Option<String>,
 }
 
@@ -48,6 +50,7 @@ impl AppState {
         let mut state = Self::default();
         state.model_list_state.select(Some(0));
         state.search_list_state.select(Some(0));
+        state.chat_scroll_state.select(Some(0));
         state
     }
 }
@@ -154,8 +157,17 @@ fn ui(frame: &mut Frame, state: &AppState) {
         if state.is_loading {
             " Loading... ".to_string()
         } else {
-            " Tab: Switch | Enter: Select/Send | d: Delete Model | r: Refresh | Esc: Quit "
-                .to_string()
+            match state.current_tab {
+                Tab::Chat => {
+                    if state.input_mode {
+                        " INSERT: typing... | Esc: exit insert | Enter: send ".to_string()
+                    } else {
+                        " NORMAL: j/k: scroll | g: top | G: bottom | i/a/Enter: input | d: del msg | Tab: switch | Esc: quit ".to_string()
+                    }
+                }
+                Tab::Models => " j/k: select | Enter: use | d: delete | r: refresh | Tab: switch | Esc: quit ".to_string(),
+                Tab::Search => " j/k: select | Enter: search | Tab: switch | Esc: quit ".to_string(),
+            }
         }
     });
 
@@ -182,30 +194,47 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect)
 
     frame.render_widget(header, chunks[0]);
 
-    let output = if state.messages.is_empty() {
-        "Welcome! Select a model from Models tab to start chatting.".to_string()
+    if state.messages.is_empty() {
+        let welcome = Paragraph::new("Welcome! Select a model from Models tab to start chatting.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(welcome, chunks[1]);
     } else {
-        let mut text = String::new();
-        for msg in &state.messages {
-            let role = match msg.role.as_str() {
-                "user" => "You",
-                "assistant" => "AI",
-                _ => &msg.role,
-            };
-            text.push_str(&format!("{}: {}\n\n", role, msg.content));
-        }
-        text
-    };
+        let items: Vec<ListItem> = state
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, msg)| {
+                let role = match msg.role.as_str() {
+                    "user" => "You",
+                    "assistant" => "AI",
+                    _ => &msg.role,
+                };
+                let style = if msg.role == "user" {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                let content = format!("{}: {}", role, msg.content);
+                ListItem::new(content).style(style)
+            })
+            .collect();
 
-    let output_widget = Paragraph::new(output)
-        .wrap(ratatui::widgets::Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL));
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" Messages "))
+            .highlight_style(Style::default())
+            .highlight_symbol("")
+            .scroll_padding(1);
 
-    frame.render_widget(output_widget, chunks[1]);
+        let mut scroll_state = state.chat_scroll_state.clone();
+        frame.render_stateful_widget(list, chunks[1], &mut scroll_state);
+    }
 
+    let input_mode_title = if state.input_mode { " INSERT " } else { " NORMAL " };
     let input = Paragraph::new(state.input_text.as_str())
         .style(Style::default().fg(Color::White))
-        .block(Block::default().borders(Borders::ALL).title(" Input "));
+        .block(Block::default().borders(Borders::ALL).title(input_mode_title));
 
     frame.render_widget(input, chunks[2]);
 }
@@ -304,62 +333,103 @@ fn render_search(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
 }
 
 fn handle_chat_input(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
-    match key {
-        KeyCode::Char(c) => {
-            state.input_text.push(c);
-        }
-        KeyCode::Backspace => {
-            state.input_text.pop();
-        }
-        KeyCode::Enter => {
-            if !state.input_text.is_empty() && state.selected_model.is_some() {
-                let user_input = state.input_text.clone();
-                state.input_text.clear();
-
-                state.messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: user_input.clone(),
-                });
-
-                let model = state.selected_model.clone().unwrap();
-                let messages = state.messages.clone();
-                let s = shared_state.clone();
-
-                state.is_loading = true;
-
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let client = OllamaClient::new(None);
-                        match client.chat(&model, messages).await {
-                            Ok(response) => {
-                                let mut s = s.lock().await;
-                                s.messages.push(response.message);
-                                s.is_loading = false;
-                            }
-                            Err(e) => {
-                                let mut s = s.lock().await;
-                                s.status_message = Some(format!("Error: {}", e));
-                                s.is_loading = false;
-                            }
-                        }
-                    });
-                });
+    if state.input_mode {
+        match key {
+            KeyCode::Char(c) => {
+                state.input_text.push(c);
             }
+            KeyCode::Backspace => {
+                state.input_text.pop();
+            }
+            KeyCode::Enter => {
+                if !state.input_text.is_empty() && state.selected_model.is_some() {
+                    let user_input = state.input_text.clone();
+                    state.input_text.clear();
+
+                    state.messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: user_input.clone(),
+                    });
+
+                    let model = state.selected_model.clone().unwrap();
+                    let messages = state.messages.clone();
+                    let s = shared_state.clone();
+
+                    state.is_loading = true;
+                    state.input_mode = false;
+
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            let client = OllamaClient::new(None);
+                            match client.chat(&model, messages).await {
+                                Ok(response) => {
+                                    let mut s = s.lock().await;
+                                    s.messages.push(response.message);
+                                    s.is_loading = false;
+                                    s.input_mode = true;
+                                }
+                                Err(e) => {
+                                    let mut s = s.lock().await;
+                                    s.status_message = Some(format!("Error: {}", e));
+                                    s.is_loading = false;
+                                    s.input_mode = true;
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+            KeyCode::Esc => {
+                state.input_mode = false;
+            }
+            _ => {}
         }
-        _ => {}
+    } else {
+        match key {
+            KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Enter => {
+                if state.selected_model.is_some() {
+                    state.input_mode = true;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(selected) = state.chat_scroll_state.selected() {
+                    if state.messages.is_empty() {
+                        return;
+                    }
+                    let new_selected = (selected + 1).min(state.messages.len() - 1);
+                    state.chat_scroll_state.select(Some(new_selected));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(selected) = state.chat_scroll_state.selected() {
+                    let new_selected = selected.saturating_sub(1);
+                    state.chat_scroll_state.select(Some(new_selected));
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if !state.messages.is_empty() {
+                    state.chat_scroll_state.select(Some(state.messages.len() - 1));
+                }
+            }
+            KeyCode::Char('g') => {
+                state.chat_scroll_state.select(Some(0));
+            }
+            KeyCode::Char('d') => {
+                if let Some(selected) = state.chat_scroll_state.selected() {
+                    if selected < state.messages.len() {
+                        state.messages.remove(selected);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 fn handle_models_input(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
     match key {
-        KeyCode::Up => {
-            if let Some(selected) = state.model_list_state.selected() {
-                let new_selected = selected.saturating_sub(1);
-                state.model_list_state.select(Some(new_selected));
-            }
-        }
-        KeyCode::Down => {
+        KeyCode::Char('j') | KeyCode::Down => {
             if let Some(selected) = state.model_list_state.selected() {
                 if state.models.is_empty() {
                     return;
@@ -367,6 +437,20 @@ fn handle_models_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
                 let new_selected = (selected + 1).min(state.models.len() - 1);
                 state.model_list_state.select(Some(new_selected));
             }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(selected) = state.model_list_state.selected() {
+                let new_selected = selected.saturating_sub(1);
+                state.model_list_state.select(Some(new_selected));
+            }
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            if !state.models.is_empty() {
+                state.model_list_state.select(Some(state.models.len() - 1));
+            }
+        }
+        KeyCode::Char('g') => {
+            state.model_list_state.select(Some(0));
         }
         KeyCode::Enter => {
             if let Some(selected) = state.model_list_state.selected() {
@@ -425,6 +509,29 @@ fn handle_models_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
 
 fn handle_search_input(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
     match key {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(selected) = state.search_list_state.selected() {
+                if state.search_results.is_empty() {
+                    return;
+                }
+                let new_selected = (selected + 1).min(state.search_results.len() - 1);
+                state.search_list_state.select(Some(new_selected));
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(selected) = state.search_list_state.selected() {
+                let new_selected = selected.saturating_sub(1);
+                state.search_list_state.select(Some(new_selected));
+            }
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            if !state.search_results.is_empty() {
+                state.search_list_state.select(Some(state.search_results.len() - 1));
+            }
+        }
+        KeyCode::Char('g') => {
+            state.search_list_state.select(Some(0));
+        }
         KeyCode::Char(c) => {
             state.search_query.push(c);
         }
@@ -454,21 +561,6 @@ fn handle_search_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
                         s.is_searching = false;
                     });
                 });
-            }
-        }
-        KeyCode::Up => {
-            if let Some(selected) = state.search_list_state.selected() {
-                let new_selected = selected.saturating_sub(1);
-                state.search_list_state.select(Some(new_selected));
-            }
-        }
-        KeyCode::Down => {
-            if let Some(selected) = state.search_list_state.selected() {
-                if state.search_results.is_empty() {
-                    return;
-                }
-                let new_selected = (selected + 1).min(state.search_results.len() - 1);
-                state.search_list_state.select(Some(new_selected));
             }
         }
         _ => {}
