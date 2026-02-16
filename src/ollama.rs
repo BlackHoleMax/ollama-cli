@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -39,18 +40,6 @@ pub struct DeleteRequest {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PullRequest {
-    pub name: String,
-    pub stream: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PullResponse {
-    pub status: Option<String>,
-    pub digest: Option<String>,
-}
-
 pub struct OllamaClient {
     base_url: String,
     client: reqwest::Client,
@@ -72,33 +61,53 @@ impl OllamaClient {
         Ok(models)
     }
 
-    pub async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> anyhow::Result<ChatResponse> {
-        let url = format!("{}/api/chat", self.base_url);
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            stream: false,
-        };
-        let response = self.client.post(&url).json(&request).send().await?;
-        let chat_response: ChatResponse = response.json().await?;
-        Ok(chat_response)
-    }
-
     pub async fn delete_model(&self, name: &str) -> anyhow::Result<()> {
         let url = format!("{}/api/delete", self.base_url);
-        let request = DeleteRequest { name: name.to_string() };
+        let request = DeleteRequest {
+            name: name.to_string(),
+        };
         self.client.delete(&url).json(&request).send().await?;
         Ok(())
     }
 
-    pub async fn pull_model(&self, name: &str) -> anyhow::Result<PullResponse> {
-        let url = format!("{}/api/pull", self.base_url);
-        let request = PullRequest {
-            name: name.to_string(),
-            stream: false,
-        };
-        let response = self.client.post(&url).json(&request).send().await?;
-        let pull_response: PullResponse = response.json().await?;
-        Ok(pull_response)
+    pub fn chat_streaming<F>(model: String, messages: Vec<ChatMessage>, callback: F) -> std::thread::JoinHandle<anyhow::Result<String>>
+    where
+        F: Fn(String) + Send + 'static,
+    {
+        let base_url = "http://localhost:11434".to_string();
+        
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::new();
+            let url = format!("{}/api/chat", base_url);
+            
+            let request = ChatRequest {
+                model,
+                messages,
+                stream: true,
+            };
+            
+            let response = client.post(&url).json(&request).send()?;
+            
+            let reader = BufReader::new(response);
+            let mut content = String::new();
+            
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                
+                if let Ok(resp) = serde_json::from_str::<ChatResponse>(&line) {
+                    content.push_str(&resp.message.content);
+                    callback(content.clone());
+                    
+                    if resp.done {
+                        break;
+                    }
+                }
+            }
+            
+            Ok(content)
+        })
     }
 }

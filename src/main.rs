@@ -42,6 +42,7 @@ pub struct AppState {
     search_list_state: ratatui::widgets::ListState,
     chat_scroll_state: ratatui::widgets::ListState,
     input_mode: bool,
+    streaming_handle: Option<std::thread::JoinHandle<anyhow::Result<String>>>,
     status_message: Option<String>,
 }
 
@@ -94,27 +95,64 @@ fn run_app(terminal: &mut DefaultTerminal, state: SharedState) -> Result<()> {
             ui(f, &s);
         })?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                let state = state.clone();
-                let mut s = state.blocking_lock();
-
-                match s.current_tab {
-                    Tab::Chat => handle_chat_input(&mut s, key.code, &state),
-                    Tab::Models => handle_models_input(&mut s, key.code, &state),
-                    Tab::Search => handle_search_input(&mut s, key.code, &state),
+        // Check if streaming is done and update state
+        {
+            let mut s = state.blocking_lock();
+            if let Some(handle) = s.streaming_handle.take() {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(Ok(content)) => {
+                            if let Some(last) = s.messages.last_mut() {
+                                if last.role == "assistant" {
+                                    last.content = content;
+                                }
+                            }
+                            s.is_loading = false;
+                            s.input_mode = true;
+                            s.streaming_handle = None;
+                        }
+                        Ok(Err(e)) => {
+                            s.status_message = Some(format!("Error: {}", e));
+                            s.is_loading = false;
+                            s.input_mode = true;
+                            s.streaming_handle = None;
+                        }
+                        Err(_) => {
+                            s.status_message = Some("Streaming interrupted".to_string());
+                            s.is_loading = false;
+                            s.input_mode = true;
+                            s.streaming_handle = None;
+                        }
+                    }
+                } else {
+                    s.streaming_handle = Some(handle);
                 }
+            }
+        }
 
-                if key.code == KeyCode::Esc {
-                    return Ok(());
-                }
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    let state = state.clone();
+                    let mut s = state.blocking_lock();
 
-                if key.code == KeyCode::Tab {
-                    s.current_tab = match s.current_tab {
-                        Tab::Chat => Tab::Models,
-                        Tab::Models => Tab::Search,
-                        Tab::Search => Tab::Chat,
-                    };
+                    match s.current_tab {
+                        Tab::Chat => handle_chat_input(&mut s, key.code, &state),
+                        Tab::Models => handle_models_input(&mut s, key.code, &state),
+                        Tab::Search => handle_search_input(&mut s, key.code, &state),
+                    }
+
+                    if key.code == KeyCode::Esc {
+                        return Ok(());
+                    }
+
+                    if key.code == KeyCode::Tab {
+                        s.current_tab = match s.current_tab {
+                            Tab::Chat => Tab::Models,
+                            Tab::Models => Tab::Search,
+                            Tab::Search => Tab::Chat,
+                        };
+                    }
                 }
             }
         }
@@ -181,7 +219,11 @@ fn ui(frame: &mut Frame, state: &AppState) {
 fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
         .split(area);
 
     let model_name = state
@@ -205,7 +247,7 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect)
             .messages
             .iter()
             .enumerate()
-            .map(|(i, msg)| {
+            .map(|(_i, msg)| {
                 let role = match msg.role.as_str() {
                     "user" => "You",
                     "assistant" => "AI",
@@ -231,10 +273,18 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect)
         frame.render_stateful_widget(list, chunks[1], &mut scroll_state);
     }
 
-    let input_mode_title = if state.input_mode { " INSERT " } else { " NORMAL " };
+    let input_mode_title = if state.input_mode {
+        " INSERT "
+    } else {
+        " NORMAL "
+    };
     let input = Paragraph::new(state.input_text.as_str())
         .style(Style::default().fg(Color::White))
-        .block(Block::default().borders(Borders::ALL).title(input_mode_title));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(input_mode_title),
+        );
 
     frame.render_widget(input, chunks[2]);
 }
@@ -351,6 +401,11 @@ fn handle_chat_input(state: &mut AppState, key: KeyCode, shared_state: &SharedSt
                         content: user_input.clone(),
                     });
 
+                    state.messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                    });
+
                     let model = state.selected_model.clone().unwrap();
                     let messages = state.messages.clone();
                     let s = shared_state.clone();
@@ -358,26 +413,17 @@ fn handle_chat_input(state: &mut AppState, key: KeyCode, shared_state: &SharedSt
                     state.is_loading = true;
                     state.input_mode = false;
 
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            let client = OllamaClient::new(None);
-                            match client.chat(&model, messages).await {
-                                Ok(response) => {
-                                    let mut s = s.lock().await;
-                                    s.messages.push(response.message);
-                                    s.is_loading = false;
-                                    s.input_mode = true;
-                                }
-                                Err(e) => {
-                                    let mut s = s.lock().await;
-                                    s.status_message = Some(format!("Error: {}", e));
-                                    s.is_loading = false;
-                                    s.input_mode = true;
-                                }
+                    let _client = OllamaClient::new(None);
+                    let handle = OllamaClient::chat_streaming(model.clone(), messages, move |chunk| {
+                        let mut s = s.blocking_lock();
+                        if let Some(last) = s.messages.last_mut() {
+                            if last.role == "assistant" {
+                                last.content = chunk;
                             }
-                        });
+                        }
                     });
+
+                    state.streaming_handle = Some(handle);
                 }
             }
             KeyCode::Esc => {
@@ -409,7 +455,9 @@ fn handle_chat_input(state: &mut AppState, key: KeyCode, shared_state: &SharedSt
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if !state.messages.is_empty() {
-                    state.chat_scroll_state.select(Some(state.messages.len() - 1));
+                    state
+                        .chat_scroll_state
+                        .select(Some(state.messages.len() - 1));
                 }
             }
             KeyCode::Char('g') => {
@@ -471,7 +519,7 @@ fn handle_models_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            let client = OllamaClient::new(None);
+                    let client = OllamaClient::new(None);
                             match client.delete_model(&model_name).await {
                                 Ok(_) => {
                                     let mut s = s.lock().await;
@@ -526,7 +574,9 @@ fn handle_search_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
         }
         KeyCode::Char('G') | KeyCode::End => {
             if !state.search_results.is_empty() {
-                state.search_list_state.select(Some(state.search_results.len() - 1));
+                state
+                    .search_list_state
+                    .select(Some(state.search_results.len() - 1));
             }
         }
         KeyCode::Char('g') => {
