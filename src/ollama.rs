@@ -36,6 +36,7 @@ pub struct ChatResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct DeleteRequest {
     pub name: String,
 }
@@ -61,6 +62,7 @@ impl OllamaClient {
         Ok(models)
     }
 
+    #[allow(dead_code)]
     pub async fn delete_model(&self, name: &str) -> anyhow::Result<()> {
         let url = format!("{}/api/delete", self.base_url);
         let request = DeleteRequest {
@@ -68,6 +70,19 @@ impl OllamaClient {
         };
         self.client.delete(&url).json(&request).send().await?;
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn chat(&self, model: &str, messages: Vec<ChatMessage>) -> anyhow::Result<String> {
+        let url = format!("{}/api/chat", self.base_url);
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: false,
+        };
+        let response = self.client.post(&url).json(&request).send().await?;
+        let chat_response: ChatResponse = response.json().await?;
+        Ok(chat_response.message.content)
     }
 
     pub fn chat_streaming<F>(model: String, messages: Vec<ChatMessage>, callback: F) -> std::thread::JoinHandle<anyhow::Result<String>>

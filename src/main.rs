@@ -10,7 +10,7 @@ use crossterm::{
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, Tabs},
     DefaultTerminal, Frame,
 };
 use std::sync::Arc;
@@ -40,9 +40,8 @@ pub struct AppState {
     is_searching: bool,
     model_list_state: ratatui::widgets::ListState,
     search_list_state: ratatui::widgets::ListState,
-    chat_scroll_state: ratatui::widgets::ListState,
-    input_mode: bool,
-    streaming_handle: Option<std::thread::JoinHandle<anyhow::Result<String>>>,
+    chat_scroll: u16,
+    auto_scroll: bool,
     status_message: Option<String>,
 }
 
@@ -51,7 +50,6 @@ impl AppState {
         let mut state = Self::default();
         state.model_list_state.select(Some(0));
         state.search_list_state.select(Some(0));
-        state.chat_scroll_state.select(Some(0));
         state
     }
 }
@@ -90,59 +88,33 @@ fn run_app(terminal: &mut DefaultTerminal, state: SharedState) -> Result<()> {
     });
 
     loop {
+        let redraw_interval = {
+            let s = state.blocking_lock();
+            if s.is_loading {
+                50
+            } else {
+                500
+            }
+        };
+
         terminal.draw(|f| {
             let s = state.blocking_lock();
             ui(f, &s);
         })?;
 
-        // Check if streaming is done and update state
-        {
-            let mut s = state.blocking_lock();
-            if let Some(handle) = s.streaming_handle.take() {
-                if handle.is_finished() {
-                    match handle.join() {
-                        Ok(Ok(content)) => {
-                            if let Some(last) = s.messages.last_mut() {
-                                if last.role == "assistant" {
-                                    last.content = content;
-                                }
-                            }
-                            s.is_loading = false;
-                            s.input_mode = true;
-                            s.streaming_handle = None;
-                        }
-                        Ok(Err(e)) => {
-                            s.status_message = Some(format!("Error: {}", e));
-                            s.is_loading = false;
-                            s.input_mode = true;
-                            s.streaming_handle = None;
-                        }
-                        Err(_) => {
-                            s.status_message = Some("Streaming interrupted".to_string());
-                            s.is_loading = false;
-                            s.input_mode = true;
-                            s.streaming_handle = None;
-                        }
-                    }
-                } else {
-                    s.streaming_handle = Some(handle);
-                }
-            }
-        }
-
-        if event::poll(std::time::Duration::from_millis(50))? {
+        if event::poll(std::time::Duration::from_millis(redraw_interval))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     let state = state.clone();
                     let mut s = state.blocking_lock();
 
                     match s.current_tab {
-                        Tab::Chat => handle_chat_input(&mut s, key.code, &state),
+                        Tab::Chat => handle_chat_key(&mut s, key.code, &state),
                         Tab::Models => handle_models_input(&mut s, key.code, &state),
                         Tab::Search => handle_search_input(&mut s, key.code, &state),
                     }
 
-                    if key.code == KeyCode::Esc {
+                    if key.code == KeyCode::Char('q') {
                         return Ok(());
                     }
 
@@ -193,18 +165,17 @@ fn ui(frame: &mut Frame, state: &AppState) {
 
     let status = state.status_message.clone().unwrap_or_else(|| {
         if state.is_loading {
-            " Loading... ".to_string()
+            " Generating... ".to_string()
         } else {
+            let model_info = state
+                .selected_model
+                .as_ref()
+                .map(|m| format!("[{}] ", m))
+                .unwrap_or_default();
             match state.current_tab {
-                Tab::Chat => {
-                    if state.input_mode {
-                        " INSERT: typing... | Esc: exit insert | Enter: send ".to_string()
-                    } else {
-                        " NORMAL: j/k: scroll | g: top | G: bottom | i/a/Enter: input | d: del msg | Tab: switch | Esc: quit ".to_string()
-                    }
-                }
-                Tab::Models => " j/k: select | Enter: use | d: delete | r: refresh | Tab: switch | Esc: quit ".to_string(),
-                Tab::Search => " j/k: select | Enter: search | Tab: switch | Esc: quit ".to_string(),
+                Tab::Chat => format!("{}Enter: send | j/k: scroll | g: top | G: bottom | Tab: switch | q: quit ", model_info),
+                Tab::Models => " j/k: select | Enter: use | Tab: switch | q: quit ".to_string(),
+                Tab::Search => " j/k: select | Enter: search | Tab: switch | q: quit ".to_string(),
             }
         }
     });
@@ -217,76 +188,64 @@ fn ui(frame: &mut Frame, state: &AppState) {
 }
 
 fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
-    let chunks = Layout::default()
+    // Split into messages area (flexible) and input area (3 lines)
+    let msg_area = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
-    let model_name = state
-        .selected_model
-        .as_deref()
-        .unwrap_or("No model selected");
-    let header = Paragraph::new(format!("Model: {}", model_name))
-        .style(Style::default().fg(Color::Cyan))
-        .block(Block::default().borders(Borders::NONE).title(" Chat "));
-
-    frame.render_widget(header, chunks[0]);
-
     if state.messages.is_empty() {
-        let welcome = Paragraph::new("Welcome! Select a model from Models tab to start chatting.")
+        let welcome = Paragraph::new("")
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL))
             .alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(welcome, chunks[1]);
+        frame.render_widget(welcome, msg_area[0]);
     } else {
-        let items: Vec<ListItem> = state
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(_i, msg)| {
-                let role = match msg.role.as_str() {
-                    "user" => "You",
-                    "assistant" => "AI",
-                    _ => &msg.role,
-                };
-                let style = if msg.role == "user" {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Green)
-                };
-                let content = format!("{}: {}", role, msg.content);
-                ListItem::new(content).style(style)
-            })
-            .collect();
+        let mut content = String::new();
+        for msg in &state.messages {
+            let role = match msg.role.as_str() {
+                "user" => "You",
+                "assistant" => "AI",
+                _ => &msg.role,
+            };
+            content.push_str(&format!("{}: {}\n\n", role, msg.content));
+        }
 
-        let list = List::new(items)
+        let total_lines = content.lines().count() as u16;
+        let viewport_lines = msg_area[0].height.saturating_sub(2);
+        let max_scroll = total_lines.saturating_sub(viewport_lines);
+        
+        let scroll = if state.auto_scroll {
+            max_scroll
+        } else {
+            state.chat_scroll.min(max_scroll)
+        };
+
+        let paragraph = Paragraph::new(content)
             .block(Block::default().borders(Borders::ALL).title(" Messages "))
-            .highlight_style(Style::default())
-            .highlight_symbol("")
-            .scroll_padding(1);
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((scroll, 0));
 
-        let mut scroll_state = state.chat_scroll_state.clone();
-        frame.render_stateful_widget(list, chunks[1], &mut scroll_state);
+        frame.render_widget(paragraph, msg_area[0]);
+
+        if total_lines > viewport_lines && total_lines > 0 {
+            let mut sb_state = ratatui::widgets::ScrollbarState::new(total_lines as usize)
+                .position(scroll as usize);
+            frame.render_stateful_widget(
+                Scrollbar::default()
+                    .orientation(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(Color::DarkGray)),
+                msg_area[0],
+                &mut sb_state,
+            );
+        }
     }
 
-    let input_mode_title = if state.input_mode {
-        " INSERT "
-    } else {
-        " NORMAL "
-    };
     let input = Paragraph::new(state.input_text.as_str())
         .style(Style::default().fg(Color::White))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(input_mode_title),
-        );
+        .block(Block::default().borders(Borders::ALL).title(" Input "));
 
-    frame.render_widget(input, chunks[2]);
+    frame.render_widget(input, msg_area[1]);
 }
 
 fn render_models(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
@@ -382,100 +341,82 @@ fn render_search(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
     }
 }
 
-fn handle_chat_input(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
-    if state.input_mode {
-        match key {
-            KeyCode::Char(c) => {
-                state.input_text.push(c);
-            }
-            KeyCode::Backspace => {
-                state.input_text.pop();
-            }
-            KeyCode::Enter => {
-                if !state.input_text.is_empty() && state.selected_model.is_some() {
-                    let user_input = state.input_text.clone();
-                    state.input_text.clear();
+fn handle_chat_key(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
+    if state.is_loading {
+        return;
+    }
 
-                    state.messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: user_input.clone(),
-                    });
+    match key {
+        KeyCode::Char('j') => {
+            state.auto_scroll = false;
+            let viewport = 5u16;
+            state.chat_scroll = state.chat_scroll.saturating_add(viewport);
+        }
+        KeyCode::Char('k') => {
+            state.auto_scroll = false;
+            let viewport = 5u16;
+            state.chat_scroll = state.chat_scroll.saturating_sub(viewport);
+        }
+        KeyCode::Char('G') => {
+            state.auto_scroll = false;
+            state.chat_scroll = u16::MAX;
+        }
+        KeyCode::Char('g') => {
+            state.auto_scroll = false;
+            state.chat_scroll = 0;
+        }
+        KeyCode::Char(c) => {
+            state.input_text.push(c);
+        }
+        KeyCode::Backspace => {
+            state.input_text.pop();
+        }
+        KeyCode::Enter => {
+            if !state.input_text.is_empty() && state.selected_model.is_some() {
+                let user_input = state.input_text.clone();
+                state.input_text.clear();
 
-                    state.messages.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: String::new(),
-                    });
+                state.messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: user_input.clone(),
+                });
 
-                    let model = state.selected_model.clone().unwrap();
-                    let messages = state.messages.clone();
-                    let s = shared_state.clone();
+                state.messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                });
 
-                    state.is_loading = true;
-                    state.input_mode = false;
+                let model = state.selected_model.clone().unwrap();
+                let messages = state.messages.clone();
+                let s_for_callback = shared_state.clone();
+                let s_for_join = shared_state.clone();
 
-                    let _client = OllamaClient::new(None);
-                    let handle = OllamaClient::chat_streaming(model.clone(), messages, move |chunk| {
-                        let mut s = s.blocking_lock();
-                        if let Some(last) = s.messages.last_mut() {
-                            if last.role == "assistant" {
-                                last.content = chunk;
-                            }
+                state.is_loading = true;
+                state.auto_scroll = true;
+
+                let handle = OllamaClient::chat_streaming(model, messages, move |chunk| {
+                    let s = s_for_callback.clone();
+                    let mut s = s.blocking_lock();
+                    if let Some(last) = s.messages.last_mut() {
+                        if last.role == "assistant" {
+                            last.content = chunk;
                         }
-                    });
+                    }
+                });
 
-                    state.streaming_handle = Some(handle);
-                }
+                std::thread::spawn(move || {
+                    let _ = handle.join();
+                    let s = s_for_join.clone();
+                    let mut s = s.blocking_lock();
+                    s.is_loading = false;
+                });
             }
-            KeyCode::Esc => {
-                state.input_mode = false;
-            }
-            _ => {}
         }
-    } else {
-        match key {
-            KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Enter => {
-                if state.selected_model.is_some() {
-                    state.input_mode = true;
-                }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(selected) = state.chat_scroll_state.selected() {
-                    if state.messages.is_empty() {
-                        return;
-                    }
-                    let new_selected = (selected + 1).min(state.messages.len() - 1);
-                    state.chat_scroll_state.select(Some(new_selected));
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(selected) = state.chat_scroll_state.selected() {
-                    let new_selected = selected.saturating_sub(1);
-                    state.chat_scroll_state.select(Some(new_selected));
-                }
-            }
-            KeyCode::Char('G') | KeyCode::End => {
-                if !state.messages.is_empty() {
-                    state
-                        .chat_scroll_state
-                        .select(Some(state.messages.len() - 1));
-                }
-            }
-            KeyCode::Char('g') => {
-                state.chat_scroll_state.select(Some(0));
-            }
-            KeyCode::Char('d') => {
-                if let Some(selected) = state.chat_scroll_state.selected() {
-                    if selected < state.messages.len() {
-                        state.messages.remove(selected);
-                    }
-                }
-            }
-            _ => {}
-        }
+        _ => {}
     }
 }
 
-fn handle_models_input(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
+fn handle_models_input(state: &mut AppState, key: KeyCode, _shared_state: &SharedState) {
     match key {
         KeyCode::Char('j') | KeyCode::Down => {
             if let Some(selected) = state.model_list_state.selected() {
@@ -507,49 +448,6 @@ fn handle_models_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
                     state.current_tab = Tab::Chat;
                 }
             }
-        }
-        KeyCode::Char('d') => {
-            if let Some(selected) = state.model_list_state.selected() {
-                if let Some(model) = state.models.get(selected) {
-                    let model_name = model.name.clone();
-                    let s = shared_state.clone();
-
-                    state.status_message = Some(format!("Deleting {}...", model_name));
-
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                    let client = OllamaClient::new(None);
-                            match client.delete_model(&model_name).await {
-                                Ok(_) => {
-                                    let mut s = s.lock().await;
-                                    s.models.retain(|m| m.name != model_name);
-                                    if s.selected_model.as_ref() == Some(&model_name) {
-                                        s.selected_model = None;
-                                    }
-                                    s.status_message = Some(format!("Deleted {}", model_name));
-                                }
-                                Err(e) => {
-                                    let mut s = s.lock().await;
-                                    s.status_message = Some(format!("Delete failed: {}", e));
-                                }
-                            }
-                        });
-                    });
-                }
-            }
-        }
-        KeyCode::Char('r') => {
-            let s = shared_state.clone();
-            state.status_message = Some("Refreshing models...".to_string());
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    refresh_models(&s).await;
-                    let mut s = s.lock().await;
-                    s.status_message = Some("Models refreshed".to_string());
-                });
-            });
         }
         _ => {}
     }
