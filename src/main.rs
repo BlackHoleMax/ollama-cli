@@ -42,6 +42,7 @@ pub struct AppState {
     search_list_state: ratatui::widgets::ListState,
     chat_scroll_state: ratatui::widgets::ListState,
     input_mode: bool,
+    streaming_content: String,
     status_message: Option<String>,
 }
 
@@ -351,32 +352,48 @@ fn handle_chat_input(state: &mut AppState, key: KeyCode, shared_state: &SharedSt
                         content: user_input.clone(),
                     });
 
-                    let model = state.selected_model.clone().unwrap();
-                    let messages = state.messages.clone();
-                    let s = shared_state.clone();
+                    state.messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                    });
 
                     state.is_loading = true;
                     state.input_mode = false;
+                    state.streaming_content = String::new();
+
+                    let s = shared_state.clone();
+                    let s2 = shared_state.clone();
+                    let model = state.selected_model.clone().unwrap();
+                    let messages = state.messages.clone();
 
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            let client = OllamaClient::new(None);
-                            match client.chat(&model, messages).await {
-                                Ok(response) => {
-                                    let mut s = s.lock().await;
-                                    s.messages.push(response.message);
-                                    s.is_loading = false;
-                                    s.input_mode = true;
+                        
+                        let content = rt.block_on(async {
+                            OllamaClient::chat_streaming(&model, messages, move |chunk| {
+                                let mut s = s2.blocking_lock();
+                                if !s.messages.is_empty() {
+                                    s.messages.last_mut().unwrap().content = chunk.clone();
                                 }
-                                Err(e) => {
-                                    let mut s = s.lock().await;
-                                    s.status_message = Some(format!("Error: {}", e));
-                                    s.is_loading = false;
-                                    s.input_mode = true;
-                                }
-                            }
+                                s.streaming_content = chunk;
+                            }).await
                         });
+                        
+                        match content {
+                            Ok(_) => {
+                                let mut s = s.blocking_lock();
+                                s.streaming_content.clear();
+                                s.is_loading = false;
+                                s.input_mode = true;
+                            }
+                            Err(e) => {
+                                let mut s = s.blocking_lock();
+                                s.status_message = Some(format!("Error: {}", e));
+                                s.streaming_content.clear();
+                                s.is_loading = false;
+                                s.input_mode = true;
+                            }
+                        }
                     });
                 }
             }

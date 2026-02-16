@@ -84,6 +84,48 @@ impl OllamaClient {
         Ok(chat_response)
     }
 
+    pub async fn chat_streaming<F>(model: &str, messages: Vec<ChatMessage>, callback: F) -> anyhow::Result<String>
+    where
+        F: Fn(String) + Send + 'static,
+    {
+        let base_url = "http://localhost:11434";
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/chat", base_url);
+        
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            stream: true,
+        };
+        
+        let response = client.post(&url).json(&request).send().await?;
+        
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        
+        let mut content = String::new();
+        
+        while let Some(item) = stream.next().await {
+            let bytes = item?;
+            let line = String::from_utf8_lossy(&bytes);
+            
+            if line.trim().is_empty() {
+                continue;
+            }
+            
+            if let Ok(resp) = serde_json::from_str::<ChatResponse>(&line) {
+                content.push_str(&resp.message.content);
+                callback(content.clone());
+                
+                if resp.done {
+                    break;
+                }
+            }
+        }
+        
+        Ok(content)
+    }
+
     pub async fn delete_model(&self, name: &str) -> anyhow::Result<()> {
         let url = format!("{}/api/delete", self.base_url);
         let request = DeleteRequest { name: name.to_string() };
