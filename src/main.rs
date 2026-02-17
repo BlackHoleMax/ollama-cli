@@ -27,7 +27,7 @@ enum Tab {
     Search,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AppState {
     current_tab: Tab,
     selected_model: Option<String>,
@@ -98,8 +98,41 @@ fn run_app(terminal: &mut DefaultTerminal, state: SharedState) -> Result<()> {
         };
 
         terminal.draw(|f| {
-            let s = state.blocking_lock();
-            ui(f, &s);
+            let mut s = state.blocking_lock();
+            if s.auto_scroll && s.current_tab == Tab::Chat && !s.messages.is_empty() {
+                let area = f.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(0),
+                        Constraint::Length(3),
+                    ])
+                    .split(area);
+                let msg_area = chunks[1];
+                let viewport_width = msg_area.width.saturating_sub(4).max(1);
+                let mut total_wrapped_lines = 0u16;
+                let mut content = String::new();
+                for msg in &s.messages {
+                    let role = match msg.role.as_str() {
+                        "user" => "You",
+                        "assistant" => "AI",
+                        _ => &msg.role,
+                    };
+                    content.push_str(&format!("{}: {}\n\n", role, msg.content));
+                }
+                for line in content.lines() {
+                    let line_len = line.len() as u16;
+                    let wrapped = (line_len.saturating_sub(1) / viewport_width).saturating_add(1);
+                    total_wrapped_lines = total_wrapped_lines.saturating_add(wrapped.max(1));
+                }
+                total_wrapped_lines =
+                    total_wrapped_lines.saturating_add((s.messages.len().saturating_sub(1)) as u16);
+                let viewport_height = msg_area.height.saturating_sub(2);
+                let max_scroll = total_wrapped_lines.saturating_sub(viewport_height);
+                s.chat_scroll = max_scroll;
+            }
+            ui(f, &mut s);
         })?;
 
         if event::poll(std::time::Duration::from_millis(redraw_interval))? {
@@ -131,7 +164,7 @@ fn run_app(terminal: &mut DefaultTerminal, state: SharedState) -> Result<()> {
     }
 }
 
-fn ui(frame: &mut Frame, state: &AppState) {
+fn ui(frame: &mut Frame, state: &mut AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -173,7 +206,10 @@ fn ui(frame: &mut Frame, state: &AppState) {
                 .map(|m| format!("[{}] ", m))
                 .unwrap_or_default();
             match state.current_tab {
-                Tab::Chat => format!("{}Enter: send | j/k: scroll | g: top | G: bottom | Tab: switch | q: quit ", model_info),
+                Tab::Chat => format!(
+                    "{}Enter: send | j/k: scroll | g: top | G: bottom | Tab: switch | q: quit ",
+                    model_info
+                ),
                 Tab::Models => " j/k: select | Enter: use | Tab: switch | q: quit ".to_string(),
                 Tab::Search => " j/k: select | Enter: search | Tab: switch | q: quit ".to_string(),
             }
@@ -211,10 +247,20 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect)
             content.push_str(&format!("{}: {}\n\n", role, msg.content));
         }
 
-        let total_lines = content.lines().count() as u16;
-        let viewport_lines = msg_area[0].height.saturating_sub(2);
-        let max_scroll = total_lines.saturating_sub(viewport_lines);
-        
+        let viewport_width = msg_area[0].width.saturating_sub(4).max(1);
+        let viewport_height = msg_area[0].height.saturating_sub(2);
+
+        let mut total_wrapped_lines = 0u16;
+        for line in content.lines() {
+            let line_len = line.len() as u16;
+            let wrapped = (line_len.saturating_sub(1) / viewport_width).saturating_add(1);
+            total_wrapped_lines = total_wrapped_lines.saturating_add(wrapped.max(1));
+        }
+        total_wrapped_lines =
+            total_wrapped_lines.saturating_add((state.messages.len().saturating_sub(1)) as u16);
+
+        let max_scroll = total_wrapped_lines.saturating_sub(viewport_height);
+
         let scroll = if state.auto_scroll {
             max_scroll
         } else {
@@ -228,8 +274,8 @@ fn render_chat(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect)
 
         frame.render_widget(paragraph, msg_area[0]);
 
-        if total_lines > viewport_lines && total_lines > 0 {
-            let mut sb_state = ratatui::widgets::ScrollbarState::new(total_lines as usize)
+        if total_wrapped_lines > viewport_height && total_wrapped_lines > 0 {
+            let mut sb_state = ratatui::widgets::ScrollbarState::new(total_wrapped_lines as usize)
                 .position(scroll as usize);
             frame.render_stateful_widget(
                 Scrollbar::default()
