@@ -147,7 +147,7 @@ fn run_app(terminal: &mut DefaultTerminal, state: SharedState) -> Result<()> {
                         Tab::Search => handle_search_input(&mut s, key.code, &state),
                     }
 
-                    if key.code == KeyCode::Char('q') {
+                    if key.code == KeyCode::Esc {
                         return Ok(());
                     }
 
@@ -207,11 +207,11 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
                 .unwrap_or_default();
             match state.current_tab {
                 Tab::Chat => format!(
-                    "{}Enter: send | j/k: scroll | g: top | G: bottom | Tab: switch | q: quit ",
+                    "{}Enter: send | j/k: scroll | g: top | G: bottom | Tab: switch | Esc: quit ",
                     model_info
                 ),
-                Tab::Models => " j/k: select | Enter: use | Tab: switch | q: quit ".to_string(),
-                Tab::Search => " j/k: select | Enter: search | Tab: switch | q: quit ".to_string(),
+                Tab::Models => " j/k: select | Enter: use | Tab: switch | Esc: quit ".to_string(),
+                Tab::Search => " j/k: select | Enter: search | Tab: switch | Esc: quit ".to_string(),
             }
         }
     });
