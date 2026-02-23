@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, Tabs},
     DefaultTerminal, Frame,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -25,6 +26,13 @@ enum Tab {
     Chat,
     Models,
     Search,
+    Prompts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedPrompt {
+    pub name: String,
+    pub content: String,
 }
 
 #[derive(Default, Clone)]
@@ -43,6 +51,15 @@ pub struct AppState {
     chat_scroll: u16,
     auto_scroll: bool,
     status_message: Option<String>,
+    // Prompts tab
+    system_prompt: String,
+    prompts: Vec<SavedPrompt>,
+    prompts_list_state: ratatui::widgets::ListState,
+    prompt_input_mode: bool,
+    prompt_edit_buffer: String,
+    prompt_name_buffer: String,
+    prompt_editing_index: Option<usize>,
+    prompt_editing_name: bool, // true: editing name, false: editing content
 }
 
 impl AppState {
@@ -50,8 +67,54 @@ impl AppState {
         let mut state = Self::default();
         state.model_list_state.select(Some(0));
         state.search_list_state.select(Some(0));
+        state.prompts_list_state.select(Some(0));
+        state.prompts = load_prompts();
+        state.prompt_editing_name = true; // 默认先编辑名称
+        if let Some(first_prompt) = state.prompts.first() {
+            state.system_prompt = first_prompt.content.clone();
+        }
         state
     }
+
+    fn get_prompts_path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let config_dir = std::path::Path::new(&home)
+            .join(".config")
+            .join("ollama-cli");
+        let _ = std::fs::create_dir_all(&config_dir);
+        config_dir.join("prompts.json")
+    }
+
+    fn save_prompts(&self) {
+        let path = Self::get_prompts_path();
+        if let Ok(json) = serde_json::to_string_pretty(&self.prompts) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+}
+
+fn load_prompts() -> Vec<SavedPrompt> {
+    let path = AppState::get_prompts_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(prompts) = serde_json::from_str(&content) {
+            return prompts;
+        }
+    }
+    // Default prompts
+    vec![
+        SavedPrompt {
+            name: "默认助手".to_string(),
+            content: "你是一个有帮助的AI助手，请用中文回答问题。".to_string(),
+        },
+        SavedPrompt {
+            name: "代码助手".to_string(),
+            content: "你是一个专业的编程助手，擅长多种编程语言。请提供清晰、高效的代码解决方案，并解释关键思路。".to_string(),
+        },
+        SavedPrompt {
+            name: "翻译助手".to_string(),
+            content: "你是一个专业的翻译助手，精通中英文互译。请准确翻译用户的内容，保持原文的语气和风格。".to_string(),
+        },
+    ]
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -145,17 +208,25 @@ fn run_app(terminal: &mut DefaultTerminal, state: SharedState) -> Result<()> {
                         Tab::Chat => handle_chat_key(&mut s, key.code, &state),
                         Tab::Models => handle_models_input(&mut s, key.code, &state),
                         Tab::Search => handle_search_input(&mut s, key.code, &state),
+                        Tab::Prompts => handle_prompts_input(&mut s, key.code),
                     }
 
-                    if key.code == KeyCode::Esc {
+                    if key.code == KeyCode::Esc && !s.prompt_input_mode {
                         return Ok(());
+                    } else if key.code == KeyCode::Esc && s.prompt_input_mode {
+                        s.prompt_input_mode = false;
+                        s.prompt_edit_buffer.clear();
+                        s.prompt_name_buffer.clear();
+                        s.prompt_editing_index = None;
+                        s.prompt_editing_name = true;
                     }
 
-                    if key.code == KeyCode::Tab {
+                    if key.code == KeyCode::Tab && !s.prompt_input_mode {
                         s.current_tab = match s.current_tab {
                             Tab::Chat => Tab::Models,
                             Tab::Models => Tab::Search,
-                            Tab::Search => Tab::Chat,
+                            Tab::Search => Tab::Prompts,
+                            Tab::Prompts => Tab::Chat,
                         };
                     }
                 }
@@ -174,11 +245,12 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
         ])
         .split(frame.area());
 
-    let tabs = Tabs::new(vec![" Chat ", " Models ", " Search "])
+    let tabs = Tabs::new(vec![" Chat ", " Models ", " Search ", " Prompts "])
         .select(match state.current_tab {
             Tab::Chat => 0,
             Tab::Models => 1,
             Tab::Search => 2,
+            Tab::Prompts => 3,
         })
         .style(Style::default().fg(Color::White))
         .highlight_style(
@@ -194,11 +266,14 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
         Tab::Chat => render_chat(frame, state, chunks[1]),
         Tab::Models => render_models(frame, state, chunks[1]),
         Tab::Search => render_search(frame, state, chunks[1]),
+        Tab::Prompts => render_prompts(frame, state, chunks[1]),
     }
 
     let status = state.status_message.clone().unwrap_or_else(|| {
         if state.is_loading {
             " Generating... ".to_string()
+        } else if state.prompt_input_mode {
+            " Enter: save | Esc: cancel | Tab: switch fields ".to_string()
         } else {
             let model_info = state
                 .selected_model
@@ -211,7 +286,13 @@ fn ui(frame: &mut Frame, state: &mut AppState) {
                     model_info
                 ),
                 Tab::Models => " j/k: select | Enter: use | Tab: switch | Esc: quit ".to_string(),
-                Tab::Search => " j/k: select | Enter: search | Tab: switch | Esc: quit ".to_string(),
+                Tab::Search => {
+                    " j/k: select | Enter: search | Tab: switch | Esc: quit ".to_string()
+                }
+                Tab::Prompts => {
+                    " j/k: select | Enter: use | e: edit | n: new | d: delete | Esc: quit "
+                        .to_string()
+                }
             }
         }
     });
@@ -387,6 +468,110 @@ fn render_search(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rec
     }
 }
 
+fn render_prompts(frame: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
+    if state.prompt_input_mode {
+        // 编辑/新建模式
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+
+        let name_title = if state.prompt_editing_index.is_some() {
+            " Edit Name "
+        } else {
+            " New Name "
+        };
+        let name_style = if state.prompt_editing_name {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let name_input = Paragraph::new(state.prompt_name_buffer.as_str())
+            .style(name_style)
+            .block(Block::default().borders(Borders::ALL).title(name_title));
+        frame.render_widget(name_input, chunks[0]);
+
+        let content_title = if state.prompt_editing_index.is_some() {
+            " Edit Content "
+        } else {
+            " New Content "
+        };
+        let content_style = if state.prompt_editing_name {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let content_input = Paragraph::new(state.prompt_edit_buffer.as_str())
+            .style(content_style)
+            .block(Block::default().borders(Borders::ALL).title(content_title));
+        frame.render_widget(content_input, chunks[1]);
+    } else {
+        // 列表模式
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(area);
+
+        // 左侧提示词列表
+        let prompt_items: Vec<ListItem> = state
+            .prompts
+            .iter()
+            .map(|p| ListItem::new(p.name.as_str()))
+            .collect();
+
+        let list = List::new(prompt_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Saved Prompts "),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+
+        let mut list_state = state.prompts_list_state.clone();
+        frame.render_stateful_widget(list, chunks[0], &mut list_state);
+
+        // 右侧当前选中提示词内容
+        let current_content = if let Some(selected) = state.prompts_list_state.selected() {
+            state
+                .prompts
+                .get(selected)
+                .map(|p| p.content.as_str())
+                .unwrap_or("No prompt selected")
+        } else {
+            "No prompt selected"
+        };
+
+        let active_indicator = if let Some(selected) = state.prompts_list_state.selected() {
+            if let Some(prompt) = state.prompts.get(selected) {
+                if prompt.content == state.system_prompt {
+                    " [ACTIVE]"
+                } else {
+                    ""
+                }
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+
+        let preview = Paragraph::new(current_content)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Preview{} ", active_indicator)),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(preview, chunks[1]);
+    }
+}
+
 fn handle_chat_key(state: &mut AppState, key: KeyCode, shared_state: &SharedState) {
     if state.is_loading {
         return;
@@ -433,7 +618,18 @@ fn handle_chat_key(state: &mut AppState, key: KeyCode, shared_state: &SharedStat
                 });
 
                 let model = state.selected_model.clone().unwrap();
-                let messages = state.messages.clone();
+                let system_prompt = state.system_prompt.clone();
+
+                // 构建包含系统提示词的消息列表
+                let mut messages = Vec::new();
+                if !system_prompt.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: system_prompt,
+                    });
+                }
+                messages.extend(state.messages.clone());
+
                 let s_for_callback = shared_state.clone();
                 let s_for_join = shared_state.clone();
 
@@ -558,6 +754,129 @@ fn handle_search_input(state: &mut AppState, key: KeyCode, shared_state: &Shared
             }
         }
         _ => {}
+    }
+}
+
+fn handle_prompts_input(state: &mut AppState, key: KeyCode) {
+    if state.prompt_input_mode {
+        // 编辑模式
+        match key {
+            KeyCode::Tab => {
+                // 切换字段
+                state.prompt_editing_name = !state.prompt_editing_name;
+            }
+            KeyCode::Char(c) => {
+                if state.prompt_editing_name {
+                    state.prompt_name_buffer.push(c);
+                } else {
+                    state.prompt_edit_buffer.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if state.prompt_editing_name {
+                    state.prompt_name_buffer.pop();
+                } else {
+                    state.prompt_edit_buffer.pop();
+                }
+            }
+            KeyCode::Enter => {
+                if !state.prompt_name_buffer.is_empty() && !state.prompt_edit_buffer.is_empty() {
+                    if let Some(idx) = state.prompt_editing_index {
+                        // 编辑现有
+                        if let Some(prompt) = state.prompts.get_mut(idx) {
+                            prompt.name = state.prompt_name_buffer.clone();
+                            prompt.content = state.prompt_edit_buffer.clone();
+                        }
+                    } else {
+                        // 新建
+                        state.prompts.push(SavedPrompt {
+                            name: state.prompt_name_buffer.clone(),
+                            content: state.prompt_edit_buffer.clone(),
+                        });
+                    }
+                    state.save_prompts();
+                    state.prompt_input_mode = false;
+                    state.prompt_edit_buffer.clear();
+                    state.prompt_name_buffer.clear();
+                    state.prompt_editing_index = None;
+                    state.prompt_editing_name = true;
+                }
+            }
+            _ => {}
+        }
+    } else {
+        // 列表模式
+        match key {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(selected) = state.prompts_list_state.selected() {
+                    if state.prompts.is_empty() {
+                        return;
+                    }
+                    let new_selected = (selected + 1).min(state.prompts.len() - 1);
+                    state.prompts_list_state.select(Some(new_selected));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(selected) = state.prompts_list_state.selected() {
+                    let new_selected = selected.saturating_sub(1);
+                    state.prompts_list_state.select(Some(new_selected));
+                }
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if !state.prompts.is_empty() {
+                    state
+                        .prompts_list_state
+                        .select(Some(state.prompts.len() - 1));
+                }
+            }
+            KeyCode::Char('g') => {
+                state.prompts_list_state.select(Some(0));
+            }
+            KeyCode::Enter => {
+                // 激活选中的提示词
+                if let Some(selected) = state.prompts_list_state.selected() {
+                    if let Some(prompt) = state.prompts.get(selected) {
+                        state.system_prompt = prompt.content.clone();
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                // 新建提示词
+                state.prompt_input_mode = true;
+                state.prompt_edit_buffer.clear();
+                state.prompt_name_buffer.clear();
+                state.prompt_editing_index = None;
+                state.prompt_editing_name = true; // 从名称开始
+            }
+            KeyCode::Char('e') => {
+                // 编辑提示词
+                if let Some(selected) = state.prompts_list_state.selected() {
+                    if let Some(prompt) = state.prompts.get(selected) {
+                        state.prompt_input_mode = true;
+                        state.prompt_name_buffer = prompt.name.clone();
+                        state.prompt_edit_buffer = prompt.content.clone();
+                        state.prompt_editing_index = Some(selected);
+                        state.prompt_editing_name = true; // 从名称开始
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                // 删除提示词
+                if let Some(selected) = state.prompts_list_state.selected() {
+                    if state.prompts.len() > 1 {
+                        state.prompts.remove(selected);
+                        state.save_prompts();
+                        // 调整选择
+                        if selected >= state.prompts.len() {
+                            state
+                                .prompts_list_state
+                                .select(Some(state.prompts.len().saturating_sub(1)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
